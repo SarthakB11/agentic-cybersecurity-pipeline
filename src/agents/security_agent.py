@@ -13,10 +13,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from operator import itemgetter
 from datetime import datetime
 from langgraph.errors import GraphRecursionError
+import uuid
 
 from ..config.settings import settings
 from ..utils.logger import logger
-from ..utils.scope_validator import scope_validator
+from ..utils.scope_validator import scope_validator, ScopeValidator
 from ..tools.nmap_tool import nmap_tool
 from ..tools.gobuster_tool import gobuster_tool
 from ..tools.ffuf_tool import ffuf_tool
@@ -154,7 +155,7 @@ class SecurityAgent:
         """Create the LangGraph workflow for security testing."""
         # Create workflow
         workflow = Graph()
-
+        
         # Define the nodes
         workflow.add_node("plan", self._plan_tasks)
         workflow.add_node("execute", self._execute_task)
@@ -173,46 +174,29 @@ class SecurityAgent:
             """Check if workflow should continue."""
             # Stop if we've hit the iteration limit
             if state["iteration_count"] >= self.max_iterations:
-                error_msg = f"Maximum iterations ({self.max_iterations}) reached"
+                error_msg = f"Maximum iterations ({self.max_iterations}) reached without completion"
                 state["errors"].append(error_msg)
-                state["should_continue"] = False
                 return False
                 
             # Stop if we've encountered a critical error
             if any("quota exceeded" in str(error).lower() for error in state["errors"]):
-                state["should_continue"] = False
                 return False
                 
-            # Stop if we have no more tasks and none are currently executing
-            if not state["task_list"] and not state["current_task"]:
-                state["should_continue"] = False
+            # Continue if we have tasks
+            if state["task_list"]:
+                return True
+                
+            # Continue if we have a current task
+            if state["current_task"]:
+                return True
+                
+            # Stop if we have completed all tasks
+            if state["completed_tasks"]:
                 return False
                 
-            # Stop if we have any parsing errors
-            if any("error parsing response" in str(error).lower() for error in state["errors"]):
-                state["should_continue"] = False
-                return False
-                
-            return state["should_continue"]
+            # Continue by default to allow for task planning
+            return True
             
-        workflow.add_conditional_edges(
-            "plan",
-            should_continue,
-            {
-                True: "execute",
-                False: END
-            }
-        )
-        
-        workflow.add_conditional_edges(
-            "execute",
-            should_continue,
-            {
-                True: "process",
-                False: END
-            }
-        )
-        
         workflow.add_conditional_edges(
             "process",
             should_continue,
@@ -221,12 +205,9 @@ class SecurityAgent:
                 False: END
             }
         )
-
-        # Configure checkpointing
-        checkpointer = MemorySaver()
         
         # Compile the graph
-        return workflow.compile(checkpointer=checkpointer)
+        return workflow.compile()
         
     async def _plan_tasks(self, state: AgentState) -> AgentState:
         """Plan the next security testing tasks."""
@@ -329,263 +310,219 @@ class SecurityAgent:
             return state
             
     async def _execute_task(self, state: AgentState) -> AgentState:
-        """Execute the next task in the queue."""
+        """Execute the current task."""
         try:
-            # Skip if no tasks or current task is running
+            # Skip if no tasks
             if not state["task_list"]:
                 return state
-                
-            # Get next task
-            next_task = state["task_list"][0]
-            task_id = str(id(next_task))
             
-            # Validate target is in scope
-            if not await scope_validator.validate_target(next_task["target"]):
-                error_msg = f"Target {next_task['target']} is not in scope"
+            # Get next task from list if no current task
+            if not state["current_task"]:
+                next_task = state["task_list"].pop(0)
+                next_task["id"] = str(uuid.uuid4())
+                state["current_task"] = next_task
+            
+            current_task = state["current_task"]
+            task_id = current_task["id"]
+            tool_name = current_task["tool"]
+            target = current_task["target"]
+            parameters = current_task.get("parameters", {})
+            
+            # Check if tool exists
+            if tool_name not in self.tools:
+                error_msg = f"Unknown tool: {tool_name}"
                 logger.error(error_msg)
                 state["errors"].append(error_msg)
-                state["task_list"].pop(0)  # Remove the out-of-scope task
-                return state
-                
-            # Set as current task
-            state["current_task"] = next_task
-            
-            # Log task start
-            log_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "action": "task_start",
-                "task_id": task_id,
-                "tool": next_task["tool"],
-                "target": next_task["target"]
-            }
-            state["logs"].append(log_entry)
-            
-            # Execute the task
-            try:
-                logger.info(f"Executing {next_task['tool']} on {next_task['target']}")
-                tool = self.tools.get(next_task["tool"])
-                if not tool:
-                    raise ValueError(f"Unknown tool: {next_task['tool']}")
-                    
-                result = await tool(
-                    next_task["target"],
-                    **(next_task.get("parameters", {}) or {})
-                )
-                
-                # Store results
                 state["results"][task_id] = {
-                    "tool": next_task["tool"],
-                    "target": next_task["target"],
-                    "parameters": next_task.get("parameters", {}),
+                    "tool": tool_name,
+                    "target": target,
+                    "parameters": parameters,
+                    "status": "failed",
+                    "error": error_msg,
+                    "started_at": datetime.now().isoformat(),
+                    "completed_at": datetime.now().isoformat()
+                }
+                state["completed_tasks"].append(task_id)
+                state["current_task"] = None
+                return state
+            
+            # Execute tool
+            logger.info(f"Executing {tool_name} on {target}")
+            try:
+                started_at = datetime.now().isoformat()
+                result = await self.tools[tool_name](target, **parameters)
+                completed_at = datetime.now().isoformat()
+                
+                # Store successful result
+                state["results"][task_id] = {
+                    "tool": tool_name,
+                    "target": target,
+                    "parameters": parameters,
                     "status": "completed",
-                    "output": result,
-                    "timestamp": datetime.now().isoformat()
+                    "result": result,
+                    "started_at": started_at,
+                    "completed_at": completed_at
                 }
-                
-                # Add to completed tasks
-                state["completed_tasks"].append(next_task)
-                
-                # Log success
-                log_entry = {
-                    "timestamp": datetime.now().isoformat(),
-                    "action": "task_complete",
-                    "task_id": task_id,
-                    "status": "success"
-                }
-                state["logs"].append(log_entry)
-                
-                # Remove from task list
-                state["task_list"].pop(0)
+                state["completed_tasks"].append(task_id)
+                state["current_task"] = None
                 
             except Exception as e:
-                logger.error(f"Error executing task: {str(e)}")
-                retry_count = state["retry_count"].get(task_id, 0)
+                error_msg = str(e)
+                logger.error(f"Error executing task: {error_msg}")
+                state["errors"].append(error_msg)
+                
+                # Get retry count for this task signature
+                task_signature = f"{tool_name}_{target}"
+                retry_count = state["retry_count"].get(task_signature, 0)
                 
                 if retry_count < self.max_retries:
                     # Increment retry count
-                    state["retry_count"][task_id] = retry_count + 1
-                    
-                    # Log retry
-                    log_entry = {
-                        "timestamp": datetime.now().isoformat(),
-                        "action": "task_retry",
-                        "task_id": task_id,
-                        "attempt": retry_count + 1,
-                        "error": str(e)
-                    }
-                    state["logs"].append(log_entry)
-                    
+                    state["retry_count"][task_signature] = retry_count + 1
                     logger.info(f"Retrying task (attempt {retry_count + 1})")
-                else:
-                    # Log failure
-                    log_entry = {
-                        "timestamp": datetime.now().isoformat(),
-                        "action": "task_failed",
-                        "task_id": task_id,
-                        "error": str(e)
-                    }
-                    state["logs"].append(log_entry)
                     
-                    logger.error(f"Max retries ({self.max_retries}) reached for task")
-                    state["errors"].append(str(e))
+                    # Store result with retry status
                     state["results"][task_id] = {
-                        "tool": next_task["tool"],
-                        "target": next_task["target"],
-                        "parameters": next_task.get("parameters", {}),
-                        "status": "failed",
-                        "error": str(e),
-                        "timestamp": datetime.now().isoformat()
+                        "tool": tool_name,
+                        "target": target,
+                        "parameters": parameters,
+                        "status": "retrying",
+                        "error": error_msg,
+                        "retry_count": retry_count + 1,
+                        "started_at": datetime.now().isoformat(),
+                        "completed_at": datetime.now().isoformat()
                     }
-                    state["task_list"].pop(0)
                     
-            finally:
-                # Clear current task
-                state["current_task"] = None
+                    # Create retry task with same signature but new ID
+                    retry_task = current_task.copy()
+                    retry_task["id"] = str(uuid.uuid4())
+                    retry_task["original_task_id"] = task_id  # Track original task
+                    state["task_list"].append(retry_task)
+                    state["current_task"] = None
+                    
+                else:
+                    # Mark as failed after max retries
+                    state["results"][task_id] = {
+                        "tool": tool_name,
+                        "target": target,
+                        "parameters": parameters,
+                        "status": "failed",
+                        "error": error_msg,
+                        "retry_count": retry_count,
+                        "started_at": datetime.now().isoformat(),
+                        "completed_at": datetime.now().isoformat()
+                    }
+                    state["completed_tasks"].append(task_id)
+                    state["current_task"] = None
                 
-            return state
-            
         except Exception as e:
-            logger.error(f"Critical error in task execution: {str(e)}")
-            state["errors"].append(str(e))
-            state["should_continue"] = False
-            return state
-            
+            error_msg = f"Error in task execution: {str(e)}"
+            logger.error(error_msg)
+            state["errors"].append(error_msg)
+            state["current_task"] = None
+        
+        return state
+        
     async def _process_results(self, state: AgentState) -> AgentState:
         """Process task results and update task list."""
         try:
-            # Get the latest completed task result
-            completed_tasks = state["completed_tasks"]
-            if not completed_tasks:
+            # Get latest result
+            latest_task_id = state["current_task"]["id"] if state["current_task"] else None
+            if not latest_task_id or latest_task_id not in state["results"]:
                 return state
-                
-            latest_task = completed_tasks[-1]
-            task_id = str(id(latest_task))
-            current_result = state["results"].get(task_id)
             
-            if not current_result:
+            latest_result = state["results"][latest_task_id]
+            
+            # Skip if task is still retrying
+            if latest_result["status"] == "retrying":
                 return state
-                
+            
+            # If this is a retry task, update the original task's result
+            if "original_task_id" in state["current_task"]:
+                original_task_id = state["current_task"]["original_task_id"]
+                if latest_result["status"] == "completed":
+                    # Copy successful result to original task
+                    state["results"][original_task_id] = latest_result.copy()
+                    state["results"][original_task_id]["id"] = original_task_id
+                    state["completed_tasks"].append(original_task_id)
+                    # Remove retry result to avoid double counting
+                    del state["results"][latest_task_id]
+                return state
+            
             try:
                 # Get task execution decision from Gemini
-                response = await self.gemini.generate_content(
-                    self.task_execution_prompt.format(
-                        target=state["target"],
-                        scope=json.dumps(state["scope"]),
-                        results=json.dumps(current_result)
-                    )
-                )
+                prompt = self._create_task_execution_prompt(state)
+                response = await self.gemini.generate_content(prompt)
                 
-                # Parse the response
                 try:
-                    # Handle both string and response object inputs
-                    response_text = response.text if hasattr(response, "text") else str(response)
-                    # Clean up the response text
-                    response_text = response_text.strip()
+                    decision = json.loads(response)
                     
-                    # Try parsing with json first
-                    try:
-                        decision = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        # Try parsing with ast.literal_eval for safer string evaluation
-                        import ast
-                        decision = ast.literal_eval(response_text)
-                    
-                    # Validate decision structure
-                    if not isinstance(decision, dict):
-                        raise ValueError("Expected a dictionary with decision data")
-                    if "new_tasks" not in decision:
-                        raise ValueError("Missing 'new_tasks' in decision")
-                    if not isinstance(decision["new_tasks"], list):
-                        raise ValueError("'new_tasks' must be a list")
-                        
-                    # Validate each new task
-                    for task in decision["new_tasks"]:
+                    # Process new tasks
+                    new_tasks = decision.get("new_tasks", [])
+                    for task in new_tasks:
                         if not isinstance(task, dict):
-                            raise ValueError("Each task must be a dictionary")
-                        required_fields = {"tool", "target", "priority"}
+                            continue
+                            
+                        required_fields = ["tool", "target", "parameters", "priority"]
                         if not all(field in task for field in required_fields):
-                            raise ValueError(f"Task missing required fields: {required_fields}")
-                        
-                except (json.JSONDecodeError, ValueError, SyntaxError) as e:
-                    logger.error(f"Error parsing task execution response: {str(e)}")
-                    # If we can't parse the response, just continue without adding new tasks
-                    state["should_continue"] = len(state["task_list"]) > 0
-                    return state
-                
-                # Handle retry decision
-                if decision.get("retry_current", False):
-                    retry_count = state["retry_count"].get(task_id, 0)
-                    if retry_count < self.max_retries:
-                        # Update task parameters
-                        latest_task["parameters"].update(
-                            decision.get("retry_parameters", {})
+                            continue
+                            
+                        # Validate target is in scope
+                        if not await self.scope_validator.validate_target(task["target"]):
+                            continue
+                            
+                        # Check if this task is already in results or task list
+                        task_signature = f"{task['tool']}_{task['target']}"
+                        is_duplicate = any(
+                            f"{r['tool']}_{r['target']}" == task_signature
+                            for r in state["results"].values()
+                        ) or any(
+                            f"{t['tool']}_{t['target']}" == task_signature
+                            for t in state["task_list"]
                         )
-                        # Add task back to the list for retry
-                        state["task_list"].insert(0, latest_task)
-                        return state
                         
-                # Add new tasks
-                new_tasks = decision.get("new_tasks", [])
-                if new_tasks:
-                    # Log new tasks
-                    log_entry = {
-                        "timestamp": datetime.now().isoformat(),
-                        "action": "tasks_added",
-                        "count": len(new_tasks),
-                        "source_task": task_id
-                    }
-                    state["logs"].append(log_entry)
-                    
-                    # Add to task list
-                    state["task_list"].extend(new_tasks)
-                    
-                    # Sort tasks by priority and dependencies
-                    state["task_list"].sort(
-                        key=lambda x: (x["priority"], len(x.get("depends_on", [])))
-                    )
-                    
+                        if not is_duplicate:
+                            task["id"] = str(uuid.uuid4())
+                            state["task_list"].append(task)
+                            
                     logger.info(f"Added {len(new_tasks)} new tasks based on results")
-                else:
-                    # No new tasks and no current tasks means we're done
-                    state["should_continue"] = len(state["task_list"]) > 0
                     
-                return state
-                
-            except RuntimeError as e:
-                if "quota exceeded" in str(e).lower():
-                    logger.error(f"Rate limit error: {str(e)}")
-                    state["errors"].append(str(e))
-                    state["should_continue"] = False
-                    return state
-                raise
+                except (json.JSONDecodeError, ValueError, SyntaxError) as e:
+                    error_msg = f"Error parsing task execution response: {str(e)}"
+                    logger.error(error_msg)
+                    
+            except Exception as e:
+                error_msg = f"Error processing results: {str(e)}"
+                logger.error(error_msg)
+                state["errors"].append(error_msg)
                 
         except Exception as e:
-            logger.error(f"Error processing results: {str(e)}")
-            # Don't stop the workflow for errors in task execution
-            state["should_continue"] = len(state["task_list"]) > 0
-            return state
+            error_msg = f"Error in result processing: {str(e)}"
+            logger.error(error_msg)
+            state["errors"].append(error_msg)
             
-    async def run_security_audit(self, target: str, scope: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a security audit workflow on the target."""
+        return state
+            
+    async def run_security_audit(self, target: str, scope: dict) -> dict:
+        """Run a security audit on the target."""
         try:
-            # Configure scope
-            scope_validator.update_scope(scope)
-            
             # Initialize state
-            state = AgentState(
-                messages=[],
-                task_list=[],
-                current_task=None,
-                results={},
-                errors=[],
-                retry_count={},
-                completed_tasks=[],
-                iteration_count=0,
-                should_continue=True,
-                logs=[],
-                target=target,
-                scope=scope
-            )
+            state = {
+                "target": target,
+                "scope": scope,
+                "task_list": [],
+                "current_task": None,
+                "results": {},
+                "errors": [],
+                "completed_tasks": [],
+                "logs": [],
+                "retry_count": {},
+                "iteration_count": 0,
+                "should_continue": True
+            }
+            
+            # Set up scope validator
+            self.scope_validator = ScopeValidator()
+            self.scope_validator.update_scope(scope)
             
             # Configure workflow
             config = {
