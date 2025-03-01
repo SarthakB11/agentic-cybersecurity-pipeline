@@ -1,12 +1,21 @@
 from pathlib import Path
 from typing import Dict, List, Optional
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 class Settings(BaseSettings):
     # Base paths
     BASE_DIR: Path = Path(__file__).parent.parent.parent
     LOGS_DIR: Path = BASE_DIR / "logs"
     DATA_DIR: Path = BASE_DIR / "data"
+    
+    # API Keys
+    OPENAI_API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
+    
+    # Model settings
+    MODEL_NAME: str = "gemini-pro"
+    TEMPERATURE: float = 0.7
     
     # Tool configurations
     NMAP_PATH: str = "nmap"  # Assumes nmap is in PATH
@@ -30,10 +39,9 @@ class Settings(BaseSettings):
     ALLOWED_IPS: List[str] = Field(default_factory=list)
     EXCLUDED_PATHS: List[str] = Field(default_factory=list)
     
-    # LangChain settings
-    OPENAI_API_KEY: Optional[str] = None
-    MODEL_NAME: str = "gpt-4"
-    TEMPERATURE: float = 0.7
+    # Google Cloud settings
+    GOOGLE_CLOUD_PROJECT: Optional[str] = None
+    GOOGLE_CLOUD_LOCATION: str = "us-central1"
     
     # Logging settings
     LOG_LEVEL: str = "INFO"

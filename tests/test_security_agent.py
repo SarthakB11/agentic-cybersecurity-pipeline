@@ -1,249 +1,228 @@
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+import asyncio
+import json
 from typing import Dict, Any
+from unittest.mock import AsyncMock, patch, MagicMock
 
-from src.agents.security_agent import security_agent, AgentState
+from src.agents.security_agent import SecurityAgent, AgentState, GeminiAPI
 from src.utils.scope_validator import scope_validator
 
-@pytest.fixture
-def mock_tool_executor():
-    """Create a mock tool executor."""
-    executor = AsyncMock()
-    executor.ainvoke = AsyncMock()
-    return executor
+# Test data
+TEST_TARGET = "example.com"
+TEST_SCOPE = {
+    "allowed_domains": ["example.com", "*.example.com"],
+    "allowed_ips": ["93.184.216.0/24"],
+    "excluded_paths": ["/admin", "/backup"]
+}
 
-@pytest.fixture
-def mock_llm():
-    """Create a mock LLM."""
-    llm = AsyncMock()
-    llm.ainvoke = AsyncMock()
-    return llm
+# Mock Gemini API responses
+MOCK_TASK_PLANNING_RESPONSE = '''[
+    {
+        "tool": "nmap_scan",
+        "target": "example.com",
+        "parameters": {"ports": "80,443"},
+        "priority": 1,
+        "depends_on": []
+    },
+    {
+        "tool": "directory_scan",
+        "target": "example.com",
+        "parameters": {"wordlist": "common.txt"},
+        "priority": 2,
+        "depends_on": ["1"]
+    }
+]'''
 
-@pytest.fixture
-def basic_state() -> AgentState:
-    """Create a basic agent state for testing."""
-    return AgentState(
-        messages=[],
-        task_list=[],
-        current_task=None,
-        results={},
-        errors=[]
-    )
-
-@pytest.mark.asyncio
-async def test_plan_tasks(mock_llm, basic_state):
-    """Test task planning functionality."""
-    # Mock LLM response
-    mock_response = MagicMock()
-    mock_response.content = '''[
+MOCK_TASK_EXECUTION_RESPONSE = '''{
+    "new_tasks": [
         {
-            "tool": "nmap_scan",
-            "target": "example.com",
-            "parameters": {"ports": "80,443"},
-            "priority": 1,
+            "tool": "fuzzing_scan",
+            "target": "http://example.com/api",
+            "parameters": {"wordlist": "api.txt"},
+            "priority": 2,
             "depends_on": []
         }
-    ]'''
-    mock_llm.ainvoke.return_value = mock_response
-    
-    # Replace security agent's LLM with mock
-    security_agent.llm = mock_llm
-    
-    # Run task planning
-    new_state = await security_agent._plan_tasks(basic_state)
-    
-    # Verify results
-    assert len(new_state["task_list"]) == 1
-    task = new_state["task_list"][0]
-    assert task["tool"] == "nmap_scan"
-    assert task["target"] == "example.com"
-    assert task["priority"] == 1
+    ],
+    "retry_current": false,
+    "retry_parameters": {}
+}'''
+
+@pytest.fixture
+def mock_gemini():
+    """Create a mock Gemini API."""
+    with patch('src.agents.security_agent.GeminiAPI') as mock:
+        mock_instance = MagicMock()
+        mock_instance.generate_content = AsyncMock()
+        mock.return_value = mock_instance
+        yield mock_instance
+
+@pytest.fixture
+def security_agent(mock_gemini):
+    """Create a security agent with mocked dependencies."""
+    agent = SecurityAgent()
+    # Mock tool responses
+    agent.tools = {
+        "nmap_scan": AsyncMock(return_value={"hosts": [{"address": "93.184.216.34", "ports": [{"portid": "80", "state": "open"}]}]}),
+        "directory_scan": AsyncMock(return_value={"directories": [{"url": "/api", "status_code": "200"}]}),
+        "fuzzing_scan": AsyncMock(return_value={"results": [{"url": "/api/v1", "status": 200}]}),
+        "sql_injection_scan": AsyncMock(return_value={"vulnerable": False})
+    }
+    return agent
 
 @pytest.mark.asyncio
-async def test_execute_task(mock_tool_executor, basic_state):
-    """Test task execution functionality."""
-    # Add a task to execute
-    task = {
-        "tool": "nmap_scan",
-        "target": "example.com",
-        "parameters": {"ports": "80,443"},
-        "priority": 1,
-        "depends_on": []
-    }
-    basic_state["task_list"].append(task)
+async def test_basic_security_audit(security_agent, mock_gemini):
+    """Test a basic security audit workflow."""
+    # Set up mock responses
+    mock_gemini.generate_content.side_effect = [
+        MOCK_TASK_PLANNING_RESPONSE,
+        MOCK_TASK_EXECUTION_RESPONSE,
+        "[]"  # No more tasks
+    ]
     
-    # Mock tool execution result
-    mock_result = {
-        "hosts": [
-            {
-                "address": "93.184.216.34",
-                "ports": [
-                    {
-                        "portid": "80",
-                        "state": "open",
-                        "service": {
-                            "name": "http",
-                            "product": "nginx"
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-    mock_tool_executor.ainvoke.return_value = mock_result
-    
-    # Replace tool executor
-    security_agent.tool_executor = mock_tool_executor
-    
-    # Execute task
-    new_state = await security_agent._execute_task(basic_state)
+    # Run security audit
+    results = await security_agent.run_security_audit(TEST_TARGET, TEST_SCOPE)
     
     # Verify results
-    assert len(new_state["task_list"]) == 0
-    assert new_state["current_task"] is not None
-    assert len(new_state["results"]) == 1
-    assert new_state["results"][id(new_state["current_task"])] == mock_result
+    assert results["target"] == TEST_TARGET
+    assert results["scope"] == TEST_SCOPE
+    assert len(results["results"]) > 0
+    assert not results["errors"]
+    
+    # Verify tool calls
+    assert security_agent.tools["nmap_scan"].called
+    assert security_agent.tools["directory_scan"].called
 
 @pytest.mark.asyncio
-async def test_process_results(mock_llm, basic_state):
-    """Test results processing functionality."""
-    # Add current task and results
-    task = {
-        "tool": "nmap_scan",
-        "target": "example.com",
-        "parameters": {"ports": "80,443"},
-        "priority": 1,
-        "depends_on": []
-    }
-    basic_state["current_task"] = task
-    basic_state["results"][id(task)] = {
-        "hosts": [
-            {
-                "address": "93.184.216.34",
-                "ports": [
-                    {
-                        "portid": "80",
-                        "state": "open",
-                        "service": {
-                            "name": "http",
-                            "product": "nginx"
-                        }
-                    }
-                ]
-            }
-        ]
-    }
+async def test_out_of_scope_target(security_agent, mock_gemini):
+    """Test handling of out-of-scope targets."""
+    # Set up mock responses
+    mock_gemini.generate_content.side_effect = [
+        '''[{"tool": "nmap_scan", "target": "evil.com", "parameters": {}, "priority": 1, "depends_on": []}]'''
+    ]
     
-    # Mock LLM response
-    mock_response = MagicMock()
-    mock_response.content = '''{
-        "new_tasks": [
-            {
-                "tool": "directory_scan",
-                "target": "http://example.com",
-                "parameters": {},
-                "priority": 2,
-                "depends_on": []
-            }
-        ],
-        "retry_current": false,
-        "retry_parameters": {}
-    }'''
-    mock_llm.ainvoke.return_value = mock_response
+    results = await security_agent.run_security_audit(
+        "evil.com",
+        TEST_SCOPE
+    )
     
-    # Replace security agent's LLM with mock
-    security_agent.llm = mock_llm
-    
-    # Process results
-    new_state = await security_agent._process_results(basic_state)
-    
-    # Verify results
-    assert new_state["current_task"] is None
-    assert len(new_state["task_list"]) == 1
-    new_task = new_state["task_list"][0]
-    assert new_task["tool"] == "directory_scan"
-    assert new_task["target"] == "http://example.com"
+    assert "errors" in results
+    assert any("not in scope" in str(error).lower() for error in results["errors"])
 
 @pytest.mark.asyncio
-async def test_run_security_audit():
-    """Test complete security audit workflow."""
-    # Mock dependencies
-    mock_llm = AsyncMock()
-    mock_tool_executor = AsyncMock()
+async def test_tool_failure_retry(security_agent, mock_gemini):
+    """Test tool failure and retry mechanism."""
+    # Make nmap tool fail first, then succeed
+    fail_then_succeed = AsyncMock()
+    fail_then_succeed.side_effect = [
+        RuntimeError("Tool failed"),
+        {"hosts": [{"address": "93.184.216.34", "ports": [{"portid": "80", "state": "open"}]}]}
+    ]
+    security_agent.tools["nmap_scan"] = fail_then_succeed
     
-    # Mock responses
-    mock_llm.ainvoke.side_effect = [
-        MagicMock(content='''[
-            {
-                "tool": "nmap_scan",
-                "target": "example.com",
-                "parameters": {"ports": "80,443"},
-                "priority": 1,
-                "depends_on": []
-            }
-        ]'''),
-        MagicMock(content='''{
+    # Set up mock responses
+    mock_gemini.generate_content.side_effect = [
+        '''[{"tool": "nmap_scan", "target": "example.com", "parameters": {}, "priority": 1, "depends_on": []}]''',
+        MOCK_TASK_EXECUTION_RESPONSE,
+        "[]"  # No more tasks
+    ]
+    
+    # Run security audit
+    results = await security_agent.run_security_audit(TEST_TARGET, TEST_SCOPE)
+    
+    # Verify retry behavior
+    assert fail_then_succeed.call_count == 2
+    assert len(results["results"]) > 0
+
+@pytest.mark.asyncio
+async def test_dynamic_task_addition(security_agent, mock_gemini):
+    """Test dynamic addition of tasks based on findings."""
+    # Set up mock responses for task planning and execution
+    mock_gemini.generate_content.side_effect = [
+        # Initial task planning
+        '''[{"tool": "nmap_scan", "target": "example.com", "parameters": {}, "priority": 1, "depends_on": []}]''',
+        # Process results - add new task based on findings
+        '''{
+            "new_tasks": [
+                {
+                    "tool": "directory_scan",
+                    "target": "http://example.com",
+                    "parameters": {},
+                    "priority": 2,
+                    "depends_on": []
+                }
+            ],
+            "retry_current": false,
+            "retry_parameters": {}
+        }''',
+        # Process second task results
+        '''{
             "new_tasks": [],
             "retry_current": false,
             "retry_parameters": {}
-        }''')
+        }'''
     ]
     
-    mock_tool_executor.ainvoke.return_value = {
-        "hosts": [
-            {
-                "address": "93.184.216.34",
-                "ports": [
-                    {
-                        "portid": "80",
-                        "state": "open",
-                        "service": {
-                            "name": "http",
-                            "product": "nginx"
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-    
-    # Replace dependencies
-    security_agent.llm = mock_llm
-    security_agent.tool_executor = mock_tool_executor
-    
     # Run security audit
-    target = "example.com"
-    scope = {
-        "allowed_domains": ["example.com"],
-        "allowed_ips": [],
-        "excluded_paths": []
-    }
+    results = await security_agent.run_security_audit(TEST_TARGET, TEST_SCOPE)
     
-    results = await security_agent.run_security_audit(target, scope)
-    
-    # Verify results
-    assert results["target"] == target
-    assert results["scope"] == scope
-    assert len(results["results"]) > 0
-    assert not results["errors"]
+    # Verify that both tools were called
+    assert security_agent.tools["nmap_scan"].called
+    assert security_agent.tools["directory_scan"].called
+    assert len(results["results"]) >= 2
 
-def test_scope_validator():
+@pytest.mark.asyncio
+async def test_scope_validation():
     """Test scope validation functionality."""
-    # Configure scope
+    # Configure scope validator
     scope_validator.allowed_domains = ["example.com", "*.example.com"]
-    scope_validator.allowed_ips = [ipaddress.ip_network("192.168.1.0/24")]
+    scope_validator.allowed_ips = ["93.184.216.0/24"]
     scope_validator.excluded_paths = ["/admin", "/backup"]
     
-    # Test domain validation
-    assert scope_validator.is_domain_in_scope("example.com")
-    assert scope_validator.is_domain_in_scope("sub.example.com")
-    assert not scope_validator.is_domain_in_scope("evil.com")
+    # Test valid cases
+    assert await scope_validator.validate_target("example.com")
+    assert await scope_validator.validate_target("sub.example.com")
+    assert await scope_validator.validate_target("93.184.216.34")
     
-    # Test IP validation
-    assert scope_validator.is_ip_in_scope("192.168.1.100")
-    assert not scope_validator.is_ip_in_scope("10.0.0.1")
+    # Test invalid cases
+    assert not await scope_validator.validate_target("evil.com")
+    assert not await scope_validator.validate_target("10.0.0.1")
     
-    # Test path exclusion
-    assert scope_validator.is_path_excluded("/admin/config")
-    assert scope_validator.is_path_excluded("/backup/db")
-    assert not scope_validator.is_path_excluded("/api/v1")
+    # Test excluded paths
+    assert not await scope_validator.validate_target("example.com/admin")
+    assert not await scope_validator.validate_target("example.com/backup/db")
+
+@pytest.mark.asyncio
+async def test_rate_limiting(security_agent, mock_gemini):
+    """Test handling of API rate limiting."""
+    # Make Gemini API fail with rate limit error first, then succeed
+    mock_gemini.generate_content.side_effect = [
+        RuntimeError("Quota exceeded for quota metric 'Generate Content API requests per minute'"),
+        MOCK_TASK_PLANNING_RESPONSE,
+        MOCK_TASK_EXECUTION_RESPONSE,
+        "[]"  # No more tasks
+    ]
+    
+    # Run security audit
+    results = await security_agent.run_security_audit(TEST_TARGET, TEST_SCOPE)
+    
+    # Verify error handling
+    assert "errors" in results
+    assert any("quota exceeded" in str(error).lower() for error in results["errors"])
+
+@pytest.mark.asyncio
+async def test_iteration_limit(security_agent, mock_gemini):
+    """Test that the workflow respects the iteration limit."""
+    # Make the workflow keep generating tasks
+    mock_gemini.generate_content.side_effect = lambda _: '''[
+        {"tool": "nmap_scan", "target": "example.com", "parameters": {}, "priority": 1, "depends_on": []}
+    ]'''
+    
+    # Run security audit
+    results = await security_agent.run_security_audit(TEST_TARGET, TEST_SCOPE)
+    
+    # Verify that the workflow stopped due to iteration limit
+    assert len(results["errors"]) > 0
+    assert any("maximum iterations" in str(error).lower() for error in results["errors"])
+
+if __name__ == "__main__":
+    pytest.main(["-v", "test_security_agent.py"])
